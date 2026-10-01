@@ -1,10 +1,9 @@
-#define UNICODE
-#define _UNICODE
 #define _WIN32_WINNT 0x0601
 
 #include <windows.h>
 #include <mmsystem.h>
 #include <magnification.h>
+#include <shellapi.h>
 #include <string>
 #include <vector>
 #include <thread>
@@ -13,9 +12,15 @@
 #include <ctime>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
+#include <cwchar>
 
 #pragma comment(lib, "winmm.lib")
 #pragma comment(lib, "Magnification.lib")
+#pragma comment(lib, "shell32.lib")
+#pragma comment(lib, "user32.lib")
+#pragma comment(lib, "gdi32.lib")
+#pragma comment(lib, "advapi32.lib")
 #pragma comment(linker, "/SUBSYSTEM:WINDOWS")
 #pragma comment(linker, "/ENTRY:wWinMainCRTStartup")
 
@@ -30,7 +35,7 @@ namespace Cfg {
     constexpr int kPhaseFinalMs    = 6000;
     constexpr int kCmdCount        = 12;
     constexpr int kErrCount        = 32;
-    constexpr int kMaxPrankMs      = 300000;  // аварийный watchdog: 5 минут
+    constexpr int kMaxPrankMs      = 300000;
 }
 
 // ================= ГЛОБАЛЫ =================
@@ -41,12 +46,9 @@ HHOOK      g_kbHook  = nullptr;
 HWND       g_magWnd  = nullptr;
 HINSTANCE  g_hInst   = nullptr;
 
-// Классы окон
-const wchar_t* ERR_CLASS  = L"NitroErr";
-const wchar_t* GLITCH_CLASS = L"NitroGlitch";
+const wchar_t* ERR_CLASS    = L"NitroErr";
 const wchar_t* SLIDE_CLASS  = L"NitroSlide";
 
-// 3D-куб
 struct CubeState {
     double angX = 0.0, angY = 0.0;
     double x = 0.0, y = 0.0;
@@ -54,6 +56,41 @@ struct CubeState {
 };
 CubeState g_cube;
 POINT     g_cursor = {0, 0};
+
+// ================= FORWARD DECLARATIONS =================
+void PumpMessages();
+void SleepPump(int ms);
+bool IsElevated();
+void RelaunchElevated();
+LRESULT CALLBACK LLKeyboardProc(int, WPARAM, LPARAM);
+void InstallKbHook();
+void RemoveKbHook();
+void InitMagnifier();
+void SetColorEffect(const MAGCOLOREFFECT* e);
+void ShowMagnifier(bool on);
+void ShutdownMagnifier();
+void ShakeScreen(int durationMs, int intensity);
+void BassThread(int durationMs);
+void PlayFurElise();
+void PianoThread(int durationMs);
+void Play8Bit();
+void EightBitThread(int durationMs);
+void DrawCube(HDC hdc, int cx, int cy, double size, double ax, double ay);
+void CubeOverlayThread(int durationMs);
+void SpawnCmdWindow(const wchar_t* text);
+void CmdSpamThread(int count, int durationMs);
+LRESULT CALLBACK ErrProc(HWND, UINT, WPARAM, LPARAM);
+void RegisterErrClass();
+void ShowErrorWindow(int x, int y, int w, int h);
+void ErrorsFillDesktop(int durationMs);
+void NoiseErrorsThread(int durationMs);
+void GlitchThread(int durationMs);
+HBITMAP CaptureScreen();
+void SlideDesktopThread(int durationMs);
+void KillExplorer();
+void ShowFinalText();
+void DoReboot();
+void WatchdogThread();
 
 // ================= УТИЛИТЫ =================
 void PumpMessages() {
@@ -63,6 +100,7 @@ void PumpMessages() {
         DispatchMessageW(&msg);
     }
 }
+
 void SleepPump(int ms) {
     DWORD start = GetTickCount();
     while ((int)(GetTickCount() - start) < ms) {
@@ -71,7 +109,7 @@ void SleepPump(int ms) {
     }
 }
 
-// ================= ПРОВЕРКА ПРАВ =================
+// ================= ПРАВА =================
 bool IsElevated() {
     HANDLE hToken = nullptr;
     if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &hToken)) return false;
@@ -86,19 +124,19 @@ bool IsElevated() {
 void RelaunchElevated() {
     wchar_t path[MAX_PATH];
     GetModuleFileNameW(nullptr, path, MAX_PATH);
-    SHELLEXECUTEINFOW sei = { sizeof(sei) };
+    SHELLEXECUTEINFOW sei = {};
+    sei.cbSize = sizeof(sei);
     sei.lpVerb = L"runas";
     sei.lpFile = path;
     sei.nShow  = SW_SHOW;
     ShellExecuteExW(&sei);
 }
 
-// ================= KEYBOARD HOOK =================
+// ================= HOOK =================
 LRESULT CALLBACK LLKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
     if (nCode == HC_ACTION) {
         if (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN ||
             wParam == WM_KEYUP   || wParam == WM_SYSKEYUP) {
-            // Ctrl+Alt+Del сюда не доходит — обрабатывает Winlogon
             return 1;
         }
     }
@@ -108,11 +146,12 @@ LRESULT CALLBACK LLKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
 void InstallKbHook() {
     g_kbHook = SetWindowsHookExW(WH_KEYBOARD_LL, LLKeyboardProc, nullptr, 0);
 }
+
 void RemoveKbHook() {
     if (g_kbHook) { UnhookWindowsHookEx(g_kbHook); g_kbHook = nullptr; }
 }
 
-// ================= MAGNIFIER / ЦВЕТОВОЙ ФИЛЬТР =================
+// ================= MAGNIFIER =================
 MAGCOLOREFFECT g_grayEffect = {
     0.30f, 0.30f, 0.30f, 0.0f, 0.0f,
     0.59f, 0.59f, 0.59f, 0.0f, 0.0f,
@@ -120,6 +159,7 @@ MAGCOLOREFFECT g_grayEffect = {
     0.0f,  0.0f,  0.0f,  1.0f, 0.0f,
     0.0f,  0.0f,  0.0f,  0.0f, 1.0f
 };
+
 MAGCOLOREFFECT g_rainbowEffect = {
     1.2f, 0.4f, 0.0f, 0.0f, 0.0f,
     0.0f, 1.2f, 0.4f, 0.0f, 0.0f,
@@ -127,6 +167,7 @@ MAGCOLOREFFECT g_rainbowEffect = {
     0.0f, 0.0f, 0.0f, 1.0f, 0.0f,
     0.0f, 0.0f, 0.0f, 0.0f, 1.0f
 };
+
 MAGCOLOREFFECT g_identityEffect = {
     1.0f, 0.0f, 0.0f, 0.0f, 0.0f,
     0.0f, 1.0f, 0.0f, 0.0f, 0.0f,
@@ -144,25 +185,29 @@ void InitMagnifier() {
         WC_MAGNIFIER, L"", WS_POPUP,
         0, 0, sw, sh, nullptr, nullptr, g_hInst, nullptr);
     if (g_magWnd) {
-        MAGTRANSFORM t = { 1,0,0, 0,1,0, 0,0,1 };
+        MAGTRANSFORM t = { 1.0f, 0.0f, 0.0f,
+                           0.0f, 1.0f, 0.0f,
+                           0.0f, 0.0f, 1.0f };
         MagSetWindowTransform(g_magWnd, &t);
         RECT src = { 0, 0, sw, sh };
         MagSetWindowSource(g_magWnd, src);
     }
 }
+
 void SetColorEffect(const MAGCOLOREFFECT* e) {
     if (g_magWnd) MagSetColorEffect(g_magWnd, (PMAGCOLOREFFECT)e);
 }
-}
+
 void ShowMagnifier(bool on) {
     if (g_magWnd) ShowWindow(g_magWnd, on ? SW_SHOWNOACTIVATE : SW_HIDE);
 }
+
 void ShutdownMagnifier() {
     if (g_magWnd) { DestroyWindow(g_magWnd); g_magWnd = nullptr; }
     MagUninitialize();
 }
 
-// ================= ТРЯСКА ЭКРАНА =================
+// ================= ТРЯСКА =================
 void ShakeScreen(int durationMs, int intensity) {
     HDC hdc = GetDC(nullptr);
     int sw = GetSystemMetrics(SM_CXSCREEN);
@@ -177,7 +222,7 @@ void ShakeScreen(int durationMs, int intensity) {
     ReleaseDC(nullptr, hdc);
 }
 
-// ================= БАС / МУЗЫКА =================
+// ================= ЗВУКИ =================
 void BassThread(int durationMs) {
     DWORD start = GetTickCount();
     while (!g_stop.load() && (int)(GetTickCount() - start) < durationMs) {
@@ -198,11 +243,12 @@ void PlayFurElise() {
         {330,150},{659,150},{622,150},{659,150},{622,150},
         {659,150},{494,150},{587,150},{523,150},{440,500}
     };
-    for (auto& n : seq) {
+    for (size_t i = 0; i < sizeof(seq)/sizeof(seq[0]); ++i) {
         if (g_stop.load()) break;
-        Beep(n[0], n[1]);
+        Beep((DWORD)seq[i][0], (DWORD)seq[i][1]);
     }
 }
+
 void PianoThread(int durationMs) {
     DWORD start = GetTickCount();
     while (!g_stop.load() && (int)(GetTickCount() - start) < durationMs) {
@@ -211,18 +257,18 @@ void PianoThread(int durationMs) {
 }
 
 void Play8Bit() {
-    // Простая «чиптюн» мелодия
     int seq[][2] = {
         {523,100},{659,100},{784,100},{1047,200},
         {988,100},{784,100},{659,200},
         {523,100},{659,100},{784,100},{880,200},
         {784,100},{659,100},{523,300}
     };
-    for (auto& n : seq) {
+    for (size_t i = 0; i < sizeof(seq)/sizeof(seq[0]); ++i) {
         if (g_stop.load()) break;
-        Beep(n[0], n[1]);
+        Beep((DWORD)seq[i][0], (DWORD)seq[i][1]);
     }
 }
+
 void EightBitThread(int durationMs) {
     DWORD start = GetTickCount();
     while (!g_stop.load() && (int)(GetTickCount() - start) < durationMs) {
@@ -238,14 +284,14 @@ void DrawCube(HDC hdc, int cx, int cy, double size, double ax, double ay) {
         {-1,-1,-1},{ 1,-1,-1},{ 1, 1,-1},{-1, 1,-1},
         {-1,-1, 1},{ 1,-1, 1},{ 1, 1, 1},{-1, 1, 1}
     };
-    for (auto& p : v) {
-        p.x *= size; p.y *= size; p.z *= size;
-        double tx =  p.x*cos(ay) - p.z*sin(ay);
-        double tz =  p.x*sin(ay) + p.z*cos(ay);
-        p.x = tx; p.z = tz;
-        double ty =  p.y*cos(ax) - p.z*sin(ax);
-        p.z =  p.y*sin(ax) + p.z*cos(ax);
-        p.y = ty;
+    for (int i = 0; i < 8; ++i) {
+        v[i].x *= size; v[i].y *= size; v[i].z *= size;
+        double tx =  v[i].x*cos(ay) - v[i].z*sin(ay);
+        double tz =  v[i].x*sin(ay) + v[i].z*cos(ay);
+        v[i].x = tx; v[i].z = tz;
+        double ty =  v[i].y*cos(ax) - v[i].z*sin(ax);
+        v[i].z =  v[i].y*sin(ax) + v[i].z*cos(ax);
+        v[i].y = ty;
     }
     POINT pt[8];
     for (int i = 0; i < 8; ++i) {
@@ -269,33 +315,20 @@ void DrawCube(HDC hdc, int cx, int cy, double size, double ax, double ay) {
 
 void CubeOverlayThread(int durationMs) {
     HDC hdc = GetDC(nullptr);
-    int sw = GetSystemMetrics(SM_CXSCREEN);
-    int sh = GetSystemMetrics(SM_CYSCREEN);
-
-    // Хвост (радужный след)
     std::vector<POINT> trail;
     trail.reserve(120);
-
     DWORD start = GetTickCount();
     while (!g_stop.load() && (int)(GetTickCount() - start) < durationMs) {
-        // Считываем позицию курсора
         POINT cur;
         GetCursorPos(&cur);
         g_cursor = cur;
-
-        // Плавное движение куба к курсору
         g_cube.x += (cur.x - g_cube.x) * 0.15;
         g_cube.y += (cur.y - g_cube.y) * 0.15;
         g_cube.angX += 0.05;
         g_cube.angY += 0.07;
 
-        // Очищаем область вокруг (перерисовываем фон — просто перекрываем)
-        // Просто рисуем поверх — фон остаётся, но куб движется
-        // Для очистки предыдущего кадра берём скриншот и восстанавливаем
-        // Упрощённо: рисуем всё заново с "backing store"
-
-        // Радужный след
-        trail.push_back({ (LONG)g_cube.x, (LONG)g_cube.y });
+        POINT p = { (LONG)g_cube.x, (LONG)g_cube.y };
+        trail.push_back(p);
         if (trail.size() > 60) trail.erase(trail.begin());
 
         for (size_t i = 0; i < trail.size(); ++i) {
@@ -315,20 +348,19 @@ void CubeOverlayThread(int durationMs) {
             DeleteObject(br);
             DeleteObject(pn);
         }
-
         DrawCube(hdc, (int)g_cube.x, (int)g_cube.y,
                  g_cube.size, g_cube.angX, g_cube.angY);
-
         Sleep(15);
     }
     ReleaseDC(nullptr, hdc);
 }
 
-// ================= CMD-ОКНА =================
+// ================= CMD =================
 void SpawnCmdWindow(const wchar_t* text) {
     wchar_t cmdLine[512];
     swprintf_s(cmdLine, L"cmd.exe /k echo %s", text);
-    STARTUPINFOW si = { sizeof(si) };
+    STARTUPINFOW si = {};
+    si.cb = sizeof(si);
     PROCESS_INFORMATION pi = {};
     CreateProcessW(nullptr, cmdLine, nullptr, nullptr, FALSE,
                    CREATE_NEW_CONSOLE, nullptr, nullptr, &si, &pi);
@@ -349,27 +381,29 @@ LRESULT CALLBACK ErrProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     if (m == WM_PAINT) {
         PAINTSTRUCT ps;
         HDC dc = BeginPaint(h, &ps);
-        RECT rc; GetClientRect(h, &rc);
+        RECT rc;
+        GetClientRect(h, &rc);
         HBRUSH bg = CreateSolidBrush(RGB(240, 240, 240));
         FillRect(dc, &rc, bg);
         DeleteObject(bg);
-        // Заголовок
         HBRUSH tb = CreateSolidBrush(RGB(0, 90, 158));
         RECT tr = { 0, 0, rc.right, 28 };
         FillRect(dc, &tr, tb);
         DeleteObject(tb);
         SetBkMode(dc, TRANSPARENT);
-        SetTextColor(dc, RGB(255,255,255));
-        HFONT ft = CreateFontW(14,0,0,0,FW_NORMAL,0,0,0,DEFAULT_CHARSET,0,0,0,0,L"Segoe UI");
+        SetTextColor(dc, RGB(255, 255, 255));
+        HFONT ft = CreateFontW(14, 0, 0, 0, FW_NORMAL, 0, 0, 0,
+            DEFAULT_CHARSET, 0, 0, 0, 0, L"Segoe UI");
         HFONT of = (HFONT)SelectObject(dc, ft);
         RECT trt = { 8, 5, rc.right - 30, 25 };
         DrawTextW(dc, L"nitrogenError.exe", -1, &trt, DT_LEFT | DT_SINGLELINE);
-        // Основной текст
-        SetTextColor(dc, RGB(0,0,0));
-        HFONT fb = CreateFontW(22,0,0,0,FW_BOLD,0,0,0,DEFAULT_CHARSET,0,0,0,0,L"Segoe UI");
+        SetTextColor(dc, RGB(0, 0, 0));
+        HFONT fb = CreateFontW(22, 0, 0, 0, FW_BOLD, 0, 0, 0,
+            DEFAULT_CHARSET, 0, 0, 0, 0, L"Segoe UI");
         SelectObject(dc, fb);
         RECT br = { 10, 40, rc.right - 10, rc.bottom - 10 };
-        DrawTextW(dc, L"эщкере))", -1, &br, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        DrawTextW(dc, L"эщкере))", -1, &br,
+                  DT_CENTER | DT_VCENTER | DT_SINGLELINE);
         SelectObject(dc, of);
         DeleteObject(ft);
         DeleteObject(fb);
@@ -396,7 +430,6 @@ void ShowErrorWindow(int x, int y, int w, int h) {
     ShowWindow(hw, SW_SHOWNOACTIVATE);
 }
 
-// 32 ошибки последовательно, заполняя экран
 void ErrorsFillDesktop(int durationMs) {
     int sw = GetSystemMetrics(SM_CXSCREEN);
     int sh = GetSystemMetrics(SM_CYSCREEN);
@@ -406,7 +439,6 @@ void ErrorsFillDesktop(int durationMs) {
     int rows = sh / wh;
     int total = cols * rows;
     if (total > Cfg::kErrCount) total = Cfg::kErrCount;
-
     int perMs = durationMs / (total > 0 ? total : 1);
     for (int i = 0; i < total && !g_stop.load(); ++i) {
         int cx = (i % cols) * ww;
@@ -416,7 +448,6 @@ void ErrorsFillDesktop(int durationMs) {
     }
 }
 
-// 3 «шумных» ошибки — с мерцанием (просто рандомная позиция, частое пересоздание)
 void NoiseErrorsThread(int durationMs) {
     int sw = GetSystemMetrics(SM_CXSCREEN);
     int sh = GetSystemMetrics(SM_CYSCREEN);
@@ -431,17 +462,17 @@ void NoiseErrorsThread(int durationMs) {
         errs.push_back(hw);
     }
     while (!g_stop.load() && (int)(GetTickCount() - start) < durationMs) {
-        for (HWND hw : errs) {
+        for (size_t i = 0; i < errs.size(); ++i) {
             int x = rand() % (sw - 300);
             int y = rand() % (sh - 200);
-            SetWindowPos(hw, HWND_TOPMOST, x, y, 300, 180, SWP_NOACTIVATE);
+            SetWindowPos(errs[i], HWND_TOPMOST, x, y, 300, 180, SWP_NOACTIVATE);
         }
         Sleep(60);
     }
-    for (HWND hw : errs) DestroyWindow(hw);
+    for (size_t i = 0; i < errs.size(); ++i) DestroyWindow(errs[i]);
 }
 
-// ================= GDI-ГЛИТЧИ =================
+// ================= ГЛИТЧИ =================
 void GlitchThread(int durationMs) {
     HDC hdc = GetDC(nullptr);
     int sw = GetSystemMetrics(SM_CXSCREEN);
@@ -449,7 +480,6 @@ void GlitchThread(int durationMs) {
     DWORD start = GetTickCount();
     int tick = 0;
     while (!g_stop.load() && (int)(GetTickCount() - start) < durationMs) {
-        // Резкие инверсии
         for (int i = 0; i < 25; ++i) {
             int x = rand() % sw;
             int y = rand() % sh;
@@ -458,7 +488,6 @@ void GlitchThread(int durationMs) {
             RECT r = { x, y, x + w, y + h };
             InvertRect(hdc, &r);
         }
-        // «Плывущие» копии
         for (int i = 0; i < 15; ++i) {
             int x = rand() % sw;
             int y = rand() % sh;
@@ -476,7 +505,7 @@ void GlitchThread(int durationMs) {
     ReleaseDC(nullptr, hdc);
 }
 
-// ================= SLIDE (лента рабочего стола) =================
+// ================= SLIDE =================
 HBITMAP CaptureScreen() {
     int sw = GetSystemMetrics(SM_CXSCREEN);
     int sh = GetSystemMetrics(SM_CYSCREEN);
@@ -491,7 +520,6 @@ HBITMAP CaptureScreen() {
     return bmp;
 }
 
-// Класс окна, которое показывает снимок и умеет «уезжать»
 struct SlideData {
     HBITMAP bmp = nullptr;
     int offsetX = 0;
@@ -512,10 +540,7 @@ LRESULT CALLBACK SlideProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     if (m == WM_PAINT) {
         PAINTSTRUCT ps;
         HDC dc = BeginPaint(h, &ps);
-        RECT rc; GetClientRect(h, &rc);
-        // Задний фон — второй снимок (он как бы «за» первым)
         DrawSlide(dc, g_slideB, 0);
-        // Передний снимок — сдвинут влево
         DrawSlide(dc, g_slideA, -g_slideA.offsetX);
         EndPaint(h, &ps);
         return 0;
@@ -553,7 +578,7 @@ void SlideDesktopThread(int durationMs) {
     while (!g_stop.load() && (int)(GetTickCount() - start) < durationMs) {
         g_slideA.offsetX += (int)speed;
         if (g_slideA.offsetX > sw) g_slideA.offsetX = 0;
-        speed *= 1.02;  // ускорение
+        speed *= 1.02;
         if (speed > 25.0) speed = 25.0;
         InvalidateRect(hw, nullptr, FALSE);
         UpdateWindow(hw);
@@ -567,10 +592,10 @@ void SlideDesktopThread(int durationMs) {
 
 // ================= ФИНАЛ =================
 void KillExplorer() {
-    // Аккуратно через CreateProcess (без system())
-    STARTUPINFOW si = { sizeof(si) };
+    STARTUPINFOW si = {};
+    si.cb = sizeof(si);
     PROCESS_INFORMATION pi = {};
-    wchar_t cmd[] = L"cmd.exe /c taskkill /f /im explorer.exe >nul 2>&1";
+    wchar_t cmd[] = L"cmd.exe /c taskkill /f /im explorer.exe";
     if (CreateProcessW(nullptr, cmd, nullptr, nullptr, FALSE,
                        CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
         WaitForSingleObject(pi.hProcess, 3000);
@@ -583,12 +608,13 @@ void ShowFinalText() {
     wchar_t tmp[MAX_PATH], path[MAX_PATH];
     GetTempPathW(MAX_PATH, tmp);
     swprintf_s(path, L"%snitrogen_final.txt", tmp);
-
     HANDLE h = CreateFileW(path, GENERIC_WRITE, 0, nullptr,
                            CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (h != INVALID_HANDLE_VALUE) {
-        const char* msg = "\xEF\xBB\xBF"  // UTF-8 BOM
-            "Спасибо что вы были с нами";
+        const char msg[] = "\xEF\xBB\xBF"
+            "\xD0\xA1\xD0\xBF\xD0\xB0\xD1\x81\xD0\xB8\xD0\xB1\xD0\xBE "
+            "\xD1\x87\xD1\x82\xD0\xBE \xD0\xB2\xD1\x8B \xD0\xB1\xD1\x8B\xD0\xBB\xD0\xB8 "
+            "\xD1\x81 \xD0\xBD\xD0\xB0\xD0\xBC\xD0\xB8";
         DWORD wr;
         WriteFile(h, msg, (DWORD)strlen(msg), &wr, nullptr);
         CloseHandle(h);
@@ -616,7 +642,6 @@ void WatchdogThread() {
     while (true) {
         if (g_stop.load()) return;
         if ((int)(GetTickCount() - start) > Cfg::kMaxPrankMs) {
-            // Аварийный выход: снимаем всё и перезагружаемся
             RemoveKbHook();
             BlockInput(FALSE);
             DoReboot();
@@ -630,14 +655,12 @@ void WatchdogThread() {
 int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int) {
     g_hInst = hInst;
 
-    // Мьютекс — не даём запуститься дважды
     HANDLE hMutex = CreateMutexW(nullptr, TRUE, L"NitrogenPrankMutex_v1");
     if (GetLastError() == ERROR_ALREADY_EXISTS) {
         if (hMutex) CloseHandle(hMutex);
         return 0;
     }
 
-    // Если не админ — перезапускаемся с UAC-запросом (один раз)
     if (!IsElevated()) {
         RelaunchElevated();
         if (hMutex) { ReleaseMutex(hMutex); CloseHandle(hMutex); }
@@ -646,7 +669,6 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int) {
 
     srand((unsigned)time(nullptr));
 
-    // ===== Шаг 1: Предупреждение =====
     int r = MessageBoxW(nullptr,
         L"ВНИМАНИЕ!\n\n"
         L"Эта программа — БЕЗОБИДНЫЙ ПРАНК.\n"
@@ -664,9 +686,8 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int) {
         return 0;
     }
 
-    // ===== Шаг 2: Блокировки + начало эффекта =====
     InstallKbHook();
-    BlockInput(TRUE);  // работает, потому что мы под админом
+    BlockInput(TRUE);
 
     RegisterErrClass();
     RegisterSlideClass();
@@ -674,27 +695,14 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int) {
 
     std::thread tWatch(WatchdogThread);
 
-    // ----- ФАЗА 1: Grayscale + тряска + бас — 16 сек -----
+    // ===== ФАЗА 1: grayscale + тряска + бас — 16 сек =====
     SetColorEffect(&g_grayEffect);
     ShowMagnifier(true);
-
     std::thread tBass1(BassThread, Cfg::kPhaseGrayMs);
-
-    DWORD f1 = GetTickCount();
-    while ((int)(GetTickCount() - f1) < Cfg::kPhaseGrayMs && !g_stop.load()) {
-        // тряска
-        HDC hdc = GetDC(nullptr);
-        int sw = GetSystemMetrics(SM_CXSCREEN);
-        int sh = GetSystemMetrics(SM_CYSCREEN);
-        int dx = (rand() % 5) - 2;
-        int dy = (rand() % 5) - 2;
-        BitBlt(hdc, dx, dy, sw, sh, hdc, 0, 0, SRCCOPY);
-        ReleaseDC(nullptr, hdc);
-        Sleep(25);
-    }
+    ShakeScreen(Cfg::kPhaseGrayMs, 2);
     tBass1.join();
 
-    // ----- ФАЗА 2: Радуга + cmd + куб + пианино — 24 сек -----
+    // ===== ФАЗА 2: радуга + cmd + куб + пианино — 24 сек =====
     SetColorEffect(&g_rainbowEffect);
     std::thread tCmd(CmdSpamThread, Cfg::kCmdCount, Cfg::kPhaseRainbowMs);
     std::thread tCube(CubeOverlayThread, Cfg::kPhaseRainbowMs);
@@ -702,23 +710,22 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int) {
     SleepPump(Cfg::kPhaseRainbowMs);
     tCmd.join(); tCube.join(); tPiano.join();
 
-    // ----- ФАЗА 3: Слайд рабочего стола + 3 шумные ошибки + звук с повышением -----
+    // ===== ФАЗА 3: слайд + шумные ошибки + «повышающийся» звук =====
     ShowMagnifier(false);
     std::thread tNoise(NoiseErrorsThread, Cfg::kPhaseSlideMs);
     std::thread tSlide(SlideDesktopThread, Cfg::kPhaseSlideMs);
-    // «Повышающийся» звук
     std::thread tRise([](int dur){
         DWORD s = GetTickCount();
         int freq = 200;
         while (!g_stop.load() && (int)(GetTickCount() - s) < dur) {
-            Beep(freq, 200);
+            Beep((DWORD)freq, 200);
             freq += 40;
             if (freq > 2000) freq = 2000;
         }
     }, Cfg::kPhaseSlideMs);
     tNoise.join(); tSlide.join(); tRise.join();
 
-    // ----- ФАЗА 4: Инверсия + глитчи + эщкере-ошибки + 8-битная музыка — 30 сек -----
+    // ===== ФАЗА 4: глитчи + эщкере-ошибки + 8-битная музыка — 30 сек =====
     SetColorEffect(&g_identityEffect);
     std::thread tGlitch(GlitchThread, Cfg::kPhaseGlitchMs);
     std::thread tErr([](int dur){
@@ -733,44 +740,30 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int) {
     std::thread t8bit(EightBitThread, Cfg::kPhaseGlitchMs);
     tGlitch.join(); tErr.join(); t8bit.join();
 
-    // ----- ФАЗА 5: Снова grayscale + тряска — 3 сек -----
+    // ===== ФАЗА 5: снова grayscale + тряска — 3 сек =====
     SetColorEffect(&g_grayEffect);
     ShowMagnifier(true);
     std::thread tBass2(BassThread, Cfg::kPhaseGray2Ms);
-    DWORD f5 = GetTickCount();
-    while ((int)(GetTickCount() - f5) < Cfg::kPhaseGray2Ms && !g_stop.load()) {
-        HDC hdc = GetDC(nullptr);
-        int sw = GetSystemMetrics(SM_CXSCREEN);
-        int sh = GetSystemMetrics(SM_CYSCREEN);
-        int dx = (rand() % 7) - 3;
-        int dy = (rand() % 7) - 3;
-        BitBlt(hdc, dx, dy, sw, sh, hdc, 0, 0, SRCCOPY);
-        ReleaseDC(nullptr, hdc);
-        Sleep(20);
-    }
+    ShakeScreen(Cfg::kPhaseGray2Ms, 3);
     tBass2.join();
 
-    // ----- ФАЗА 6: 32 ошибки последовательно, заполняя экран — 10 сек -----
+    // ===== ФАЗА 6: 32 ошибки — 10 сек =====
     SetColorEffect(&g_identityEffect);
     ShowMagnifier(false);
     ErrorsFillDesktop(Cfg::kPhaseErrorsMs);
 
-    // ----- ФАЗА 7: Крашим explorer, показываем текст, ждём 6 сек и ребут -----
+    // ===== ФАЗА 7: крашим explorer, показываем текст, ребут =====
     KillExplorer();
     SleepPump(400);
     ShowFinalText();
     SleepPump(Cfg::kPhaseFinalMs);
 
-    // ===== Шаг 8: Снимаем блокировки и перезагружаемся =====
     RemoveKbHook();
     BlockInput(FALSE);
-
     g_stop = true;
     if (tWatch.joinable()) tWatch.join();
-
     ShutdownMagnifier();
 
-    // Реальная перезагрузка. После неё UAC снова работает штатно.
     DoReboot();
 
     if (hMutex) { ReleaseMutex(hMutex); CloseHandle(hMutex); }
