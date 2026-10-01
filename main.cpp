@@ -151,7 +151,8 @@ void InitMagnifier() {
     }
 }
 void SetColorEffect(const MAGCOLOREFFECT* e) {
-    if (g_magWnd) MagSetColorEffect(g_magWnd, e);
+    if (g_magWnd) MagSetColorEffect(g_magWnd, (PMAGCOLOREFFECT)e);
+}
 }
 void ShowMagnifier(bool on) {
     if (g_magWnd) ShowWindow(g_magWnd, on ? SW_SHOWNOACTIVATE : SW_HIDE);
